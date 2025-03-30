@@ -22,7 +22,7 @@ async def rewrite_query(
             chat_query=query,
             history=history
         )
-        return enhanced_query
+        return {"query": enhanced_query}
 
     except Exception as e:
         log.error(f"Query rewrite error: {e}")
@@ -38,15 +38,17 @@ async def start_completion(
         messages: list,
         stream: bool,
         knowledge_ids: list = None,
-        **kwargs
+        additional_kwargs: dict = None
 ):
+    additional_kwargs = additional_kwargs or {}
+
     async def stream_content():
         async for chunk in model_service.start_completions(
                 user_id=user_id,
                 messages=messages,
                 stream=stream,
                 knowledge_ids=knowledge_ids,
-                **kwargs
+                **additional_kwargs
         ):
             if chunk is not None:
                 yield chunk

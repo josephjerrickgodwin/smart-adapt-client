@@ -41,7 +41,7 @@ async def fine_tune(
             answer_column_name=answer_column_name
         )
 
-        return {"status": "Successful"}
+        return {"status": "successful"}
 
     except FineTuningDisabledError as e:
         log.error(f"Fine-tuning error: {e}")
@@ -87,6 +87,8 @@ async def delete_lora_adapter(
             shutil.rmtree(lora_path)
         if os.path.exists(logs_path) and len(os.listdir(logs_path)):
             shutil.rmtree(logs_path)
+
+        return {"status": "successful"}
 
     except Exception as e:
         log.error(f"LoRA adapter removal error: {e}")
