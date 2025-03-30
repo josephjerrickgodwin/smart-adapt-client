@@ -1,0 +1,16 @@
+pandas==2.2.3
+torch==2.5.1
+transformers==4.48.3
+trl==0.13.0
+requests==2.32.3
+pydantic==2.10.6
+fastapi==0.115.8
+uvicorn==0.34.0
+pandas==2.2.3
+ftfy==6.2.3
+datasets==3.2.0
+python-dotenv==1.0.1
+peft==0.14.0
+bitsandbytes==0.45.1
+scikit-learn==1.6.1
+python-multipart==0.0.18
