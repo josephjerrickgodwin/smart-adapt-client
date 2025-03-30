@@ -17,7 +17,7 @@ log.setLevel("INFO")
 router = APIRouter(prefix="/api/v1", tags=["Fine Tuning"])
 
 
-@router.post("/completions")
+@router.post("/fine-tune")
 async def fine_tune(
         user_id: str,
         knowledge_id: str,
@@ -65,7 +65,7 @@ async def fine_tune(
         )
 
 
-@router.delete("/completions")
+@router.delete("/adapter")
 async def delete_lora_adapter(
         user_id: str,
         knowledge_id: str
