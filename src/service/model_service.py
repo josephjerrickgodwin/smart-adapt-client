@@ -153,7 +153,7 @@ class ModelService:
         # Return the captured group or the original text if no match
         return match.group(1) if match else text
 
-    def _load_adapter(
+    def _load_adapters(
             self,
             user_id: str,
             knowledge_ids=None,
@@ -180,13 +180,12 @@ class ModelService:
 
         # If the user adapter is already exist, skip loading it again
         if self.lora_loaded:
-            if user_id == self.current_user:
+            if user_id == self.current_user and knowledge_ids == self.loaded_lora_ids:
                 logger.info('LoRA adapter already loaded. Skipping auto assign')
                 return
             else:
                 logger.info('Removing LoRA adapter of the previous user')
-                self.model.delete_adapter(self.current_user)
-                self.lora_loaded = False
+                self.flush()
 
         # Retrieve the user data path
         data_path = storage_manager.get_user_dir(user_id)
@@ -207,10 +206,11 @@ class ModelService:
             self.model = PeftModel.from_pretrained(
                 self.model,
                 lora_path,
-                adapter_name=user_id
+                adapter_name=knowledge_id
             ).to(self.device)
 
             self.lora_loaded = True
+            self.loaded_lora_ids.append(knowledge_id)
 
         # Merge the adapter permanently
         if self.lora_loaded and merge_and_unload:
@@ -269,8 +269,6 @@ class ModelService:
         thinker_kwargs = dict(
             input_ids=tokens.input_ids,
             max_new_tokens=512,
-            attention_mask=tokens.attention_mask,
-            pad_token_id=self.tokenizer.eos_token_id,
             repetition_penalty=self.repetition_penalty,
             streamer=streamer
         )
@@ -308,7 +306,7 @@ class ModelService:
             raise InferenceDisabledError("The model is being trained. Please try again later!")
 
         # Load user adapter
-        self._load_adapter(user_id, knowledge_ids)
+        self._load_adapters(user_id, knowledge_ids)
 
         # Define the streamer
         logger.info('Initializing the tokenizer properties')
@@ -334,8 +332,6 @@ class ModelService:
         # Define the generation kwargs
         kwargs = dict(
             input_ids=tokens.input_ids,
-            attention_mask=tokens.attention_mask,
-            pad_token_id=self.tokenizer.eos_token_id,
             max_new_tokens=2048,
             repetition_penalty=self.repetition_penalty,
             streamer=streamer,
@@ -360,6 +356,9 @@ class ModelService:
                 if chunk is not None:
                     chunks += chunk
             yield chunks
+
+        if self.lora_loaded:
+            self.flush()
 
         logger.info('Request have been served successfully')
 
