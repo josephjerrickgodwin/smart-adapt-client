@@ -125,7 +125,7 @@ async def fine_tune(
 async def delete_lora_adapter(user_id: str, knowledge_id: str):
     try:
         # Check for model Knowledge
-        userdata_dir = await storage_manager.get_user_dir(user_id)
+        userdata_dir = storage_manager.get_user_dir(user_id)
         lora_path = model_service.get_lora_path(
             data_path=userdata_dir,
             knowledge_id=knowledge_id

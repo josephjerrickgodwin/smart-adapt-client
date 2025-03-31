@@ -153,7 +153,7 @@ class ModelService:
         # Return the captured group or the original text if no match
         return match.group(1) if match else text
 
-    async def _load_adapter(
+    def _load_adapter(
             self,
             user_id: str,
             knowledge_ids=None,
@@ -189,7 +189,7 @@ class ModelService:
                 self.lora_loaded = False
 
         # Retrieve the user data path
-        data_path = await storage_manager.get_user_dir(user_id)
+        data_path = storage_manager.get_user_dir(user_id)
 
         # Load and merge multiple LoRA adapters
         for knowledge_id in knowledge_ids:
@@ -308,7 +308,7 @@ class ModelService:
             raise InferenceDisabledError("The model is being trained. Please try again later!")
 
         # Load user adapter
-        await self._load_adapter(user_id, knowledge_ids)
+        self._load_adapter(user_id, knowledge_ids)
 
         # Define the streamer
         logger.info('Initializing the tokenizer properties')
@@ -336,6 +336,7 @@ class ModelService:
             input_ids=tokens.input_ids,
             attention_mask=tokens.attention_mask,
             pad_token_id=self.tokenizer.eos_token_id,
+            max_new_tokens=2048,
             repetition_penalty=self.repetition_penalty,
             streamer=streamer,
             **params
@@ -393,7 +394,7 @@ class ModelService:
         # Set padding token
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    async def fine_tuning_handler(
+    def fine_tuning_handler(
             self,
             df: pd.DataFrame,
             user_id: str,
@@ -469,7 +470,7 @@ class ModelService:
             hyperparameters = self.calculate_lora_hyperparameters(len(df))
 
             # Start training the model
-            await self.fine_tune(
+            self.fine_tune(
                 user_id=user_id,
                 train_df=train_df,
                 eval_df=eval_df,
@@ -495,11 +496,7 @@ class ModelService:
                 data=file_data
             )
 
-    async def prepare_model(
-            self,
-            r: int,
-            lora_alpha: int
-    ):
+    def prepare_model(self, r: int, lora_alpha: int):
         """
             Prepare the base model for fine-tuning.
 
@@ -525,7 +522,7 @@ class ModelService:
         # Apply LoRA to the model
         self.model = get_peft_model(self.model, peft_config).to(self.device)
 
-    async def fine_tune(
+    def fine_tune(
             self,
             user_id: str,
             train_df: Any,
@@ -588,7 +585,7 @@ class ModelService:
         self.flush()
 
         # Prepare the data storage
-        data_path = await storage_manager.get_user_dir(user_id)
+        data_path = storage_manager.get_user_dir(user_id)
 
         # Define the adapter and logs path
         adapter_path = self.get_lora_path(
@@ -601,7 +598,7 @@ class ModelService:
         )
 
         # Prepare model and tokenizer
-        await self.prepare_model(
+        self.prepare_model(
             r=r,
             lora_alpha=lora_alpha
         )

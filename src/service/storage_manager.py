@@ -16,7 +16,7 @@ class StorageManager:
     def __init__(self):
         self.data_dir = os.path.join(os.getcwd(), "data")
 
-    async def get_user_dir(self, user_id: str) -> str:
+    def get_user_dir(self, user_id: str) -> str:
         """
         Create and return the directory path for a specific user.
 
@@ -38,7 +38,7 @@ class StorageManager:
         :raises FileExistsError: If file already exists
         """
         # Sanitize filename and get user directory
-        user_dir = await self.get_user_dir(user_id)
+        user_dir = self.get_user_dir(user_id)
 
         # Construct full file path
         file_path = os.path.join(user_dir, f"{filename}.pkl")
@@ -63,7 +63,7 @@ class StorageManager:
         :raises FileNotFoundError: If file does not exist
         """
         # Sanitize filename and get user directory
-        user_dir = await self.get_user_dir(user_id)
+        user_dir = self.get_user_dir(user_id)
 
         # Construct full file path
         file_path = os.path.join(user_dir, f"{filename}.pkl")
@@ -83,7 +83,7 @@ class StorageManager:
         :raises FileNotFoundError: If file does not exist
         """
         # Sanitize filename and get user directory
-        user_dir = await self.get_user_dir(user_id)
+        user_dir = self.get_user_dir(user_id)
 
         # Construct full file path
         file_path = os.path.join(user_dir, f"{filename}.pkl")
@@ -107,7 +107,7 @@ class StorageManager:
         :return: True if file was deleted, False if file did not exist
         """
         # Sanitize filename and get user directory
-        user_dir = await self.get_user_dir(user_id)
+        user_dir = self.get_user_dir(user_id)
 
         # Construct full file path
         file_path = os.path.join(user_dir, f"{filename}.pkl")
@@ -137,7 +137,7 @@ class StorageManager:
         :return: List of pickle filenames
         """
         # Get user directory
-        user_dir = await self.get_user_dir(user_id)
+        user_dir = self.get_user_dir(user_id)
 
         # List all .pkl files in the user's directory
         return [f for f in os.listdir(user_dir) if f.endswith('.pkl')]

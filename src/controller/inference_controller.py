@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api/v1", tags=["Chat Completions"])
 @router.post("/rewrite", status_code=status.HTTP_200_OK)
 async def rewrite_query(query: str, history: list):
     try:
-        enhanced_query = model_service.rewrite_query(
+        enhanced_query = await model_service.rewrite_query(
             chat_query=query,
             history=history
         )
