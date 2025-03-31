@@ -26,6 +26,7 @@ from trl import SFTTrainer, SFTConfig
 from src.exception.fine_tuning_disabled_error import FineTuningDisabledError
 from src.exception.inference_disabled_error import InferenceDisabledError
 from src.service import prompt_service
+from src.service.database.knowledge import Knowledge_table
 from src.service.storage_manager import storage_manager
 from src.service.smart_adapt_streamer import SmartAdaptStreamer
 
@@ -399,81 +400,100 @@ class ModelService:
             knowledge_id: str,
             question_column_name: str,
             answer_column_name: str,
+            file_data: dict
     ):
-        # Pre-process the data
-        documents = []
-        for index, row in df.iterrows():
-            question = row[question_column_name]
-            answer = row[answer_column_name]
+        try:
+            # Pre-process the data
+            documents = []
+            for index, row in df.iterrows():
+                question = row[question_column_name]
+                answer = row[answer_column_name]
 
-            # Skip any empty rows
-            if not question or not answer:
-                continue
+                # Skip any empty rows
+                if not question or not answer:
+                    continue
 
-            # Fix any inconsistencies
-            question = ftfy.fix_text(question)
-            answer = ftfy.fix_text(answer)
+                # Fix any inconsistencies
+                question = ftfy.fix_text(question)
+                answer = ftfy.fix_text(answer)
 
-            # Formulate the history
-            history = [
-                {
-                    "role": "user",
-                    "content": question
-                },
-                {
-                    "role": "assistant",
-                    "content": answer
-                }
-            ]
+                # Formulate the history
+                history = [
+                    {
+                        "role": "user",
+                        "content": question
+                    },
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
+                ]
 
-            # Apply the chat template
-            formatted_history = self.tokenizer.apply_chat_template(history, tokenize=False)
+                # Apply the chat template
+                formatted_history = self.tokenizer.apply_chat_template(history, tokenize=False)
 
-            # Tokenize the text
-            tokenized_data = self.tokenizer(
-                formatted_history,
-                padding="max_length",
-                truncation=True,
-                max_length=512
+                # Tokenize the text
+                tokenized_data = self.tokenizer(
+                    formatted_history,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=512
+                )
+
+                # Create labels (shifted input IDs for causal language modeling)
+                tokenized_data["labels"] = tokenized_data["input_ids"].copy()
+
+                # Ignore padding tokens for loss calculation
+                tokenized_data["labels"][tokenized_data["labels"] == self.tokenizer.pad_token_id] = -100
+                documents.append(tokenized_data)
+
+            # Remove the previous dataframe
+            del df
+            gc.collect()
+
+            # Check for documents are present
+            if not documents:
+                raise ValueError("No documents")
+
+            # Convert to DataFrame
+            df = pd.DataFrame(documents)
+
+            # Split for train, eval
+            train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
+
+            # Convert to dataset supportable format
+            train_df = Dataset.from_pandas(train_df)
+            eval_df = Dataset.from_pandas(eval_df)
+
+            # Calculate LoRA Hyperparameters
+            hyperparameters = self.calculate_lora_hyperparameters(len(df))
+
+            # Start training the model
+            await self.fine_tune(
+                user_id=user_id,
+                train_df=train_df,
+                eval_df=eval_df,
+                knowledge_id=knowledge_id,
+                r=hyperparameters['r'],
+                lora_alpha=hyperparameters['lora_alpha']
             )
 
-            # Create labels (shifted input IDs for causal language modeling)
-            tokenized_data["labels"] = tokenized_data["input_ids"].copy()
+            # Update the knowledge status
+            file_data['status'] = 'Completed'
+            _ = Knowledge_table.update_knowledge_data_by_id(
+                id=knowledge_id,
+                data=file_data
+            )
 
-            # Ignore padding tokens for loss calculation
-            tokenized_data["labels"][tokenized_data["labels"] == self.tokenizer.pad_token_id] = -100
-            documents.append(tokenized_data)
+        except Exception as e:
+            logger.error(f"Fine-tuning error: {e}")
 
-        # Remove the previous dataframe
-        del df
-        gc.collect()
-
-        # Check for documents are present
-        if not documents:
-            raise ValueError("No documents")
-
-        # Convert to DataFrame
-        df = pd.DataFrame(documents)
-
-        # Split for train, eval
-        train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
-
-        # Convert to dataset supportable format
-        train_df = Dataset.from_pandas(train_df)
-        eval_df = Dataset.from_pandas(eval_df)
-
-        # Calculate LoRA Hyperparameters
-        hyperparameters = self.calculate_lora_hyperparameters(len(df))
-
-        # Start training the model
-        await self.fine_tune(
-            user_id=user_id,
-            train_df=train_df,
-            eval_df=eval_df,
-            knowledge_id=knowledge_id,
-            r=hyperparameters['r'],
-            lora_alpha=hyperparameters['lora_alpha']
-        )
+            # Update the knowledge status
+            file_data['status'] = 'Failed'
+            _ = Knowledge_table.update_knowledge_data_by_id(
+                id=knowledge_id,
+                data=file_data
+            )
 
     async def prepare_model(
             self,

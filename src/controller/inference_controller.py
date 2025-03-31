@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from src.exception.inference_disabled_error import InferenceDisabledError
+from src.model.completions_model import CompletionRequest
 from src.service.model_service import model_service
 
 log = logging.getLogger(__name__)
@@ -12,11 +13,8 @@ log.setLevel("INFO")
 router = APIRouter(prefix="/api/v1", tags=["Chat Completions"])
 
 
-@router.post("/rewrite")
-async def rewrite_query(
-        query: str,
-        history: list
-):
+@router.post("/rewrite", status_code=status.HTTP_200_OK)
+async def rewrite_query(query: str, history: list):
     try:
         enhanced_query = model_service.rewrite_query(
             chat_query=query,
@@ -32,15 +30,13 @@ async def rewrite_query(
         )
 
 
-@router.post("/completions")
-async def start_completion(
-        user_id: str,
-        messages: list,
-        stream: bool,
-        knowledge_ids: list = None,
-        additional_kwargs: dict = None
-):
-    additional_kwargs = additional_kwargs or {}
+@router.post("/completions", status_code=status.HTTP_200_OK)
+async def start_completion(data: CompletionRequest):
+    user_id = data.user_id
+    messages = data.messages
+    stream = data.stream
+    knowledge_ids = data.knowledge_ids or []
+    additional_kwargs = data.additional_kwargs or {}
 
     async def stream_content():
         async for chunk in model_service.start_completions(
