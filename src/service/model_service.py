@@ -410,7 +410,7 @@ class ModelService:
                 answer = row[answer_column_name]
 
                 # Skip any empty rows
-                if not question or not answer:
+                if not question or not answer or isinstance(question, float) or isinstance(answer, float):
                     continue
 
                 # Fix any inconsistencies
