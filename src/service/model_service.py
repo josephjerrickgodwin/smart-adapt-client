@@ -115,15 +115,8 @@ class ModelService:
             raise ValueError("Model size and dataset size must be positive")
 
         # Calculate r and alpha based on the dataset size
-        if dataset_size <= 1000:
-            r = 8
-            lora_alpha = 16
-        elif dataset_size <= 100000:
-            r = 32
-            lora_alpha = 64
-        else:
-            r = 64
-            lora_alpha = 128
+        r = 8 if dataset_size <= 1000 else 32 if dataset_size <= 100000 else 64
+        lora_alpha = r * 2
 
         return {'r': r, 'lora_alpha': lora_alpha}
 
@@ -357,9 +350,6 @@ class ModelService:
                     chunks += chunk
             yield chunks
 
-        if self.lora_loaded:
-            self.flush()
-
         logger.info('Request have been served successfully')
 
     def _load_weights(self):
@@ -370,8 +360,8 @@ class ModelService:
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=False,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
         )
 
         # Load the tokenizer
@@ -529,20 +519,19 @@ class ModelService:
             r: int,
             lora_alpha: int,
             knowledge_id: str,
-            fp16: bool = True,
+            fp16: bool = False,
             bf16: bool = False,
-            fp16_full_eval: bool = True,
-            num_epochs: int = 3,
+            num_epochs: int = 2,
             eval_steps: int = 100,
-            optim: str = "adamw_bnb_8bit",
+            optim: str = "paged_adamw_32bit",
             logging_steps: int = 10,
-            warmup_steps: int = 500,
+            warmup_steps: int = 50,
             max_seq_len: int = 512,
-            group_by_length: bool = False,
+            group_by_length: bool = True,
             learning_rate: float = 2e-4,
-            per_device_train_batch_size=2,
-            per_device_eval_batch_size=2,
-            gradient_accumulation_steps=1,
+            per_device_train_batch_size=5,
+            per_device_eval_batch_size=5,
+            gradient_accumulation_steps=2,
             report_to: str = 'none'
     ):
         """
@@ -557,7 +546,6 @@ class ModelService:
             knowledge_id (str): Unique ID of the knowledge request
             fp16 (bool): Whether to use float16
             bf16 (bool): Whether to use bfloat16
-            fp16_full_eval (bool): Whether to perform evaluation in float16
             num_epochs (int): Number of training epochs
             max_seq_len (int): Maximum sequence length from the dataset
             group_by_length (int): Whether to group the dataset by the length of the longest sequence
@@ -618,7 +606,6 @@ class ModelService:
             learning_rate=learning_rate,
             fp16=fp16,
             bf16=bf16,
-            fp16_full_eval=fp16_full_eval,
             group_by_length=group_by_length,
             max_seq_length=max_seq_len,
             report_to=report_to
