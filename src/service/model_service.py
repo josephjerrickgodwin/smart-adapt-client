@@ -8,24 +8,22 @@ from typing import Any
 import ftfy
 import pandas as pd
 import torch
+import wandb
 from datasets import Dataset
 from dotenv import load_dotenv
 from peft import (
     PeftModel,
     LoraConfig,
-    get_peft_model,
+    get_peft_model
 )
 from sklearn.model_selection import train_test_split
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainerCallback,
-    TrainerControl,
-    TrainerState,
-    TrainingArguments
+    BitsAndBytesConfig
 )
 from trl import SFTTrainer, SFTConfig
+from src.service.callback.cancel_callback import CancelCallback
 
 from src.exception.fine_tuning_disabled_error import FineTuningDisabledError
 from src.exception.inference_disabled_error import InferenceDisabledError
@@ -41,7 +39,8 @@ logger = logging.getLogger(__name__)
 # Load the Sentence Transformer Model and the HF token
 MODEL_ID = str(os.getenv('MODEL_ID'))
 HF_TOKEN = str(os.getenv('HF_TOKEN'))
-
+wandb_api_key = str(os.getenv("WANDB_API_KEY"))
+wandb_project = str(os.getenv("WANDB_PROJECT", "smart-adapt"))
 
 class ModelService:
     """
@@ -628,6 +627,34 @@ class ModelService:
             lora_alpha=lora_alpha
         )
 
+        # Initialise Weights & Biases (W&B) tracking if an API key is available
+        use_wandb = bool(wandb_api_key)
+        if use_wandb:
+            # Log in to W&B using the API key from the environment (.env)
+            wandb.login(key=wandb_api_key, reinit=True)
+
+            # Use a descriptive run name containing the user_id and knowledge_id for easy lookup
+            run_name = f"{user_id}_{knowledge_id}"
+
+            # Start the run and attach useful metadata
+            wandb.init(
+                project=wandb_project,
+                name=run_name,
+                tags=[knowledge_id, user_id],
+                config={
+                    "lora_r": r,
+                    "lora_alpha": lora_alpha,
+                    "epochs": num_epochs,
+                    "learning_rate": learning_rate,
+                    "batch_size": per_device_train_batch_size,
+                },
+            )
+
+            # Ensure the trainer logs to W&B
+            report_to = "wandb"
+        else:
+            report_to = "none"
+
         # Training arguments
         training_arguments = SFTConfig(
             output_dir=logs_dir_path,
@@ -654,26 +681,6 @@ class ModelService:
         self._cancel_events[user_id] = cancel_event
 
         # Define cancellation callback
-        class CancelCallback(TrainerCallback):
-            """Internal callback class to cooperatively stop training when the user
-            requests cancellation via ``stop_fine_tuning``."""
-
-            def __init__(self, _event: Event):
-                self._event = _event
-
-            def on_step_end(
-                self,
-                args: TrainingArguments,
-                state: TrainerState,
-                control: TrainerControl,
-                **kwargs,
-            ) -> TrainerControl:  # type: ignore[override]
-                if self._event.is_set():
-                    control.should_training_stop = True
-                    control.should_epoch_stop = True
-                    control.should_save = True
-                return control
-
         cancel_callback = CancelCallback(cancel_event)
 
         # Initialize trainer with cancellation callback
@@ -682,9 +689,9 @@ class ModelService:
             train_dataset=train_df,
             eval_dataset=eval_df,
             peft_config=None,  # Already applied
-            tokenizer=self.tokenizer,
+            processing_class=self.tokenizer,
             args=training_arguments,
-            callbacks=[cancel_callback],
+            callbacks=[cancel_callback]
         )
 
         # Perform training
@@ -699,6 +706,13 @@ class ModelService:
 
         # Reset the memory and weights
         self.flush()
+
+        # Finish the W&B run if one was started
+        if use_wandb:
+            try:
+                wandb.finish()
+            except Exception:  # noqa: BLE001
+                pass  # Ignore any wandb specific errors during shutdown
 
     def stop_fine_tuning(self, user_id: str):
         """Request cancellation of an ongoing fine-tune job for the given user.
