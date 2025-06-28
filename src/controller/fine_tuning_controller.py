@@ -154,3 +154,26 @@ async def delete_lora_adapter(user_id: str, knowledge_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@router.post("/fine-tune/stop", status_code=status.HTTP_200_OK)
+async def stop_fine_tune(user_id: str = Form(...)):
+    """Endpoint to request cancellation of an ongoing fine-tuning job.
+    The request is identified solely by the `user_id` who started it.
+    """
+    try:
+        model_service.stop_fine_tuning(user_id)
+        return {"status": "successful"}
+
+    except ValueError as e:
+        log.error(f"Stop fine-tune error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        log.error(f"Stop fine-tune error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )

@@ -1,3 +1,5 @@
 .venv/
 .idea/
 database/data.db
+__pycache__/
+**/__pycache__/

@@ -2,7 +2,7 @@ import gc
 import logging
 import os
 import re
-from threading import Thread
+from threading import Thread, Event
 from typing import Any
 
 import ftfy
@@ -19,7 +19,11 @@ from sklearn.model_selection import train_test_split
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments
 )
 from trl import SFTTrainer, SFTConfig
 
@@ -55,8 +59,7 @@ class ModelService:
 
         # Define the device
         if torch.cuda.is_available():
-            current_device_index = torch.cuda.current_device()
-            self.device = torch.device(f"cuda:{current_device_index}")
+            self.device = torch.device(f"cuda")
         else:
             self.device = torch.device("cpu")
 
@@ -66,14 +69,28 @@ class ModelService:
         self.inference_enabled = True
         self.loaded_lora_ids = []
 
+        # Stores cancel events for ongoing fine-tune jobs keyed by user_id
+        self._cancel_events: dict[str, Event] = {}
+
         # Define repetition penalty for completions
         self.repetition_penalty = 1.2
 
         # Load weights
         self._load_weights()
 
-    def flush(self):
-        # Disable inference temporarily
+    def flush(self, reset_inference_enabled: bool = True):
+        """
+        Flushes the currently loaded model from memory and reloads the base weights.
+
+        Args:
+            reset_inference_enabled (bool): Whether the ``inference_enabled`` flag
+                should be set back to ``True`` after the reload is complete. When
+                performing a long-running operation such as fine-tuning you may
+                want to keep inference disabled until the operation has
+                finished. Defaults to ``True`` so existing call-sites keep the
+                original behaviour.
+        """
+        # Disable inference temporarily while we unload the model
         self.inference_enabled = False
 
         # Unload the thinker and inference models along with the tokenizers
@@ -86,14 +103,15 @@ class ModelService:
 
         # Clear cache
         gc.collect()
-        if self.device == 'cuda':
+        if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
         # Load the model again
         self._load_weights()
 
-        # Reset the inference status
-        self.inference_enabled = True
+        # Reset the inference status only if requested
+        if reset_inference_enabled:
+            self.inference_enabled = True
         self.loaded_lora_ids = []
 
     @classmethod
@@ -111,8 +129,8 @@ class ModelService:
         - ValueError: If input parameters are invalid.
         """
         # Input validation
-        if not dataset_size:
-            raise ValueError("Model size and dataset size must be positive")
+        if dataset_size <= 0:
+            raise ValueError("Dataset size must be a positive integer")
 
         # Calculate r and alpha based on the dataset size
         r = 8 if dataset_size <= 1000 else 32 if dataset_size <= 100000 else 64
@@ -393,19 +411,29 @@ class ModelService:
             file_data: dict
     ):
         try:
+            if df is None:
+                raise ValueError("Dataset is None")
+            if self.model is None:
+                raise ValueError("Model is not loaded")
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer is not loaded")
+
             # Pre-process the data
             documents = []
             for index, row in df.iterrows():
                 question = row[question_column_name]
                 answer = row[answer_column_name]
 
-                # Skip any empty rows
-                if not question or not answer or isinstance(question, float) or isinstance(answer, float):
+                # Basic validation / cleaning
+                if pd.isnull(question) or pd.isnull(answer):
                     continue
 
-                # Fix any inconsistencies
-                question = ftfy.fix_text(question)
-                answer = ftfy.fix_text(answer)
+                question = ftfy.fix_text(str(question))
+                answer = ftfy.fix_text(str(answer))
+
+                # Skip if either side is empty after stripping
+                if not question.strip() or not answer.strip():
+                    continue
 
                 # Formulate the history
                 history = [
@@ -470,6 +498,16 @@ class ModelService:
 
             # Update the knowledge status
             file_data['status'] = 'Completed'
+            _ = Knowledge_table.update_knowledge_data_by_id(
+                id=knowledge_id,
+                data=file_data
+            )
+
+        except ValueError as e:
+            logger.error(f"Validation error while fine-tuning: {e}")
+
+            # Update the knowledge status
+            file_data['status'] = 'Failed'
             _ = Knowledge_table.update_knowledge_data_by_id(
                 id=knowledge_id,
                 data=file_data
@@ -568,8 +606,8 @@ class ModelService:
         # Disable inference during training
         self.inference_enabled = False
 
-        # Unload and reset weights
-        self.flush()
+        # Unload and reset weights while keeping inference disabled
+        self.flush(reset_inference_enabled=False)
 
         # Prepare the data storage
         data_path = storage_manager.get_user_dir(user_id)
@@ -611,7 +649,34 @@ class ModelService:
             report_to=report_to
         )
 
-        # Initialize trainer
+        # Create/record a cancellation event for this user
+        cancel_event = Event()
+        self._cancel_events[user_id] = cancel_event
+
+        # Define cancellation callback
+        class CancelCallback(TrainerCallback):
+            """Internal callback class to cooperatively stop training when the user
+            requests cancellation via ``stop_fine_tuning``."""
+
+            def __init__(self, _event: Event):
+                self._event = _event
+
+            def on_step_end(
+                self,
+                args: TrainingArguments,
+                state: TrainerState,
+                control: TrainerControl,
+                **kwargs,
+            ) -> TrainerControl:  # type: ignore[override]
+                if self._event.is_set():
+                    control.should_training_stop = True
+                    control.should_epoch_stop = True
+                    control.should_save = True
+                return control
+
+        cancel_callback = CancelCallback(cancel_event)
+
+        # Initialize trainer with cancellation callback
         trainer = SFTTrainer(
             model=self.model,
             train_dataset=train_df,
@@ -619,6 +684,7 @@ class ModelService:
             peft_config=None,  # Already applied
             tokenizer=self.tokenizer,
             args=training_arguments,
+            callbacks=[cancel_callback],
         )
 
         # Perform training
@@ -628,8 +694,26 @@ class ModelService:
         os.makedirs(adapter_path, exist_ok=True)
         trainer.model.save_pretrained(adapter_path)
 
+        # Remove cancel event reference
+        self._cancel_events.pop(user_id, None)
+
         # Reset the memory and weights
         self.flush()
+
+    def stop_fine_tuning(self, user_id: str):
+        """Request cancellation of an ongoing fine-tune job for the given user.
+
+        This works cooperatively: the training loop will stop at the end of the
+        current step. If no job is found for the user an error is raised.
+        """
+        cancel_event = self._cancel_events.get(user_id)
+        if cancel_event is None:
+            raise ValueError("No active fine-tuning task for the specified user.")
+
+        # Signal the training loop to stop
+        cancel_event.set()
+
+        logger.info(f"Cancellation requested for user {user_id}'s fine-tune job.")
 
 
 model_service = ModelService()
