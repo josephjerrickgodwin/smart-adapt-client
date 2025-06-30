@@ -31,6 +31,8 @@ from src.service import prompt_service
 from src.service.database.knowledge import Knowledge_table
 from src.service.storage_manager import storage_manager
 from src.service.smart_adapt_streamer import SmartAdaptStreamer
+import zipfile
+import io
 
 load_dotenv()
 
@@ -347,7 +349,6 @@ class ModelService:
             streamer=streamer,
             **params
         )
-
         logger.info('Started the response generation')
 
         # Define the thread
@@ -629,9 +630,11 @@ class ModelService:
 
         # Initialise Weights & Biases (W&B) tracking if an API key is available
         use_wandb = bool(wandb_api_key)
+
+        report_to = "none"
         if use_wandb:
             # Log in to W&B using the API key from the environment (.env)
-            wandb.login(key=wandb_api_key, reinit=True)
+            wandb.login(key=wandb_api_key)
 
             # Use a descriptive run name containing the user_id and knowledge_id for easy lookup
             run_name = f"{user_id}_{knowledge_id}"
@@ -652,8 +655,6 @@ class ModelService:
 
             # Ensure the trainer logs to W&B
             report_to = "wandb"
-        else:
-            report_to = "none"
 
         # Training arguments
         training_arguments = SFTConfig(
@@ -729,5 +730,26 @@ class ModelService:
 
         logger.info(f"Cancellation requested for user {user_id}'s fine-tune job.")
 
+    def get_lora_zip_stream(self, user_id: str, knowledge_id: str) -> io.BytesIO:
+        """
+        Zips the LoRA adapter directory for the given user_id and knowledge_id and returns a BytesIO stream.
+        Raises FileNotFoundError if the directory does not exist or is empty.
+        """
+        userdata_dir = storage_manager.get_user_dir(user_id)
+        lora_path = self.get_lora_path(
+            data_path=userdata_dir,
+            knowledge_id=knowledge_id
+        )
+        if not os.path.exists(lora_path) or not os.listdir(lora_path):
+            raise FileNotFoundError("LoRA adapter directory not found or is empty.")
+        zip_stream = io.BytesIO()
+        with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(lora_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, lora_path)
+                    zipf.write(file_path, arcname)
+        zip_stream.seek(0)
+        return zip_stream
 
 model_service = ModelService()
