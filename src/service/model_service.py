@@ -3,24 +3,26 @@ import logging
 import os
 import re
 from threading import Thread, Event
-from typing import Any
+from typing import Optional, Union
 
 import ftfy
+import numpy as np
 import pandas as pd
 import torch
 import wandb
 from datasets import Dataset
 from dotenv import load_dotenv
-from peft import (
-    PeftModel,
-    LoraConfig,
-    get_peft_model
-)
+from peft.peft_model import PeftModel
+from peft.mixed_model import PeftMixedModel
+from peft.tuners.lora import LoraConfig
+from peft.mapping import get_peft_model
 from sklearn.model_selection import train_test_split
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer
 )
 from trl import SFTTrainer, SFTConfig
 from src.service.callback.cancel_callback import CancelCallback
@@ -33,6 +35,7 @@ from src.service.storage_manager import storage_manager
 from src.service.smart_adapt_streamer import SmartAdaptStreamer
 import zipfile
 import io
+
 
 load_dotenv()
 
@@ -50,31 +53,31 @@ class ModelService:
     """
 
     def __init__(self):
-        self.token = HF_TOKEN
-        self.data_model_name = 'adapters'
-        self.logs_dir = 'logs'
+        self.token: str = HF_TOKEN
+        self.data_model_name: str = 'adapters'
+        self.logs_dir: str = 'logs'
 
         # Define model and tokenizer for reasoning
-        self.tokenizer = None
-        self.model = None
+        self.tokenizer: Optional[PreTrainedTokenizer] = None
+        self.model: Optional[Union[PreTrainedModel, PeftModel, PeftMixedModel]] = None
 
         # Define the device
-        if torch.cuda.is_available():
-            self.device = torch.device(f"cuda")
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu") 
 
         # Define the current user
-        self.current_user = None
-        self.lora_loaded = False
-        self.inference_enabled = True
-        self.loaded_lora_ids = []
+        self.current_user: Optional[str] = None
+        self.lora_loaded: bool = False
+        self.inference_enabled: bool = True
+        self.loaded_lora_ids: list[str] = []
 
         # Stores cancel events for ongoing fine-tune jobs keyed by user_id
         self._cancel_events: dict[str, Event] = {}
 
         # Define repetition penalty for completions
-        self.repetition_penalty = 1.2
+        self.repetition_penalty: float = 1.2
+
+        # Define the training token limit
+        self.max_seq_len: int = 512
 
         # Load weights
         self._load_weights()
@@ -182,6 +185,9 @@ class ModelService:
         Returns:
             text-generation pipeline
         """
+        if self.model is None:
+            raise ValueError("Model is not initialized")
+
         # Check for the current user
         if knowledge_ids is None:
             knowledge_ids = []
@@ -225,7 +231,7 @@ class ModelService:
             self.loaded_lora_ids.append(knowledge_id)
 
         # Merge the adapter permanently
-        if self.lora_loaded and merge_and_unload:
+        if self.lora_loaded and merge_and_unload and isinstance(self.model, PeftModel):
             self.model = self.model.merge_and_unload()
 
         # Assign the current user
@@ -234,8 +240,12 @@ class ModelService:
     async def rewrite_query(
             self,
             current_query: str,
-            history: list
+            history: list,
+            max_seq_len: int = 512
     ):
+        if self.tokenizer is None or self.model is None:
+            raise ValueError("Model or tokenizer is not initialized")
+
         logger.info('Started extracting user messages from the history...')
 
         # Extract previous queries
@@ -280,9 +290,10 @@ class ModelService:
         # Define the generation kwargs
         thinker_kwargs = dict(
             input_ids=tokens.input_ids,
-            max_new_tokens=512,
+            max_new_tokens=max_seq_len,
             repetition_penalty=self.repetition_penalty,
-            streamer=streamer
+            streamer=streamer,
+            **self._generation_defaults()
         )
         logger.info('Started generating the updated query...')
 
@@ -317,6 +328,9 @@ class ModelService:
         if not self.inference_enabled:
             raise InferenceDisabledError("The model is being trained. Please try again later!")
 
+        if self.tokenizer is None or self.model is None:
+            raise ValueError("Model or tokenizer is not initialized")
+
         # Load user adapter
         self._load_adapters(user_id, knowledge_ids)
 
@@ -347,6 +361,7 @@ class ModelService:
             max_new_tokens=2048,
             repetition_penalty=self.repetition_penalty,
             streamer=streamer,
+            **self._generation_defaults(),
             **params
         )
         logger.info('Started the response generation')
@@ -389,17 +404,43 @@ class ModelService:
             token=self.token
         )
 
+        # Ensure we have pad and eos tokens; fall back to unk_token if absent
+        if self.tokenizer.pad_token is None:
+            # Prefer reusing EOS or UNK as pad token to avoid resizing
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
+
+        if self.tokenizer.eos_token is None:
+            # Use pad_token as EOS when missing
+            self.tokenizer.eos_token = self.tokenizer.pad_token
+
         # Load the model
         logger.info('Started loading the model')
         self.model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             token=self.token,
-            device_map=self.device,
+            device_map="auto",
             quantization_config=bnb_config
         )
 
         # Set padding token
         self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _generation_defaults(self):
+        """Return safe generation kwargs, omitting pad/eos IDs if they are undefined."""
+        defaults = {
+            "do_sample": True,
+            "top_p": 0.9,
+            "temperature": 0.7,
+        }
+        if self.tokenizer is not None:
+            if self.tokenizer.pad_token_id is not None:
+                defaults["pad_token_id"] = self.tokenizer.pad_token_id
+            if self.tokenizer.eos_token_id is not None:
+                defaults["eos_token_id"] = self.tokenizer.eos_token_id
+        return defaults
 
     def fine_tuning_handler(
             self,
@@ -411,8 +452,8 @@ class ModelService:
             file_data: dict
     ):
         try:
-            if df is None:
-                raise ValueError("Dataset is None")
+            if df is None or not isinstance(df, pd.DataFrame):
+                raise ValueError("Dataset must be a pandas DataFrame")
             if self.model is None:
                 raise ValueError("Model is not loaded")
             if self.tokenizer is None:
@@ -425,7 +466,7 @@ class ModelService:
                 answer = row[answer_column_name]
 
                 # Basic validation / cleaning
-                if pd.isnull(question) or pd.isnull(answer):
+                if pd.isna(question) or pd.isna(answer):
                     continue
 
                 question = ftfy.fix_text(str(question))
@@ -455,14 +496,33 @@ class ModelService:
                     formatted_history,
                     padding="max_length",
                     truncation=True,
-                    max_length=512
+                    max_length=self.max_seq_len
                 )
 
-                # Create labels (shifted input IDs for causal language modeling)
-                tokenized_data["labels"] = tokenized_data["input_ids"].copy()
+                # Convert input_ids to list for manipulation
+                input_ids = tokenized_data["input_ids"].tolist() if isinstance(tokenized_data["input_ids"], torch.Tensor) else tokenized_data["input_ids"]
 
-                # Ignore padding tokens for loss calculation
-                tokenized_data["labels"][tokenized_data["labels"] == self.tokenizer.pad_token_id] = -100
+                # Build a label mask initialised to -100 (ignored by the loss)
+                labels = [-100] * len(input_ids)
+
+                # Token-ids of the assistant answer
+                answer_token_ids = self.tokenizer(
+                    answer,
+                    add_special_tokens=False
+                )["input_ids"]
+
+                # Starting from the end, copy answer tokens onto the label mask
+                idx_input = len(input_ids) - 1
+                idx_answer = len(answer_token_ids) - 1
+                pad_id = self.tokenizer.pad_token_id
+
+                while idx_input >= 0 and idx_answer >= 0:
+                    if input_ids[idx_input] != pad_id:
+                        labels[idx_input] = answer_token_ids[idx_answer]
+                        idx_answer -= 1
+                    idx_input -= 1
+
+                tokenized_data["labels"] = labels
                 documents.append(tokenized_data)
 
             # Remove the previous dataframe
@@ -471,26 +531,26 @@ class ModelService:
 
             # Check for documents are present
             if not documents:
-                raise ValueError("No documents")
+                raise ValueError("No valid documents found in the dataset")
 
             # Convert to DataFrame
-            df = pd.DataFrame(documents)
+            processed_df = pd.DataFrame(documents)
 
             # Split for train, eval
-            train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
+            train_df, eval_df = train_test_split(processed_df, test_size=0.2, random_state=42)
 
             # Convert to dataset supportable format
-            train_df = Dataset.from_pandas(train_df)
-            eval_df = Dataset.from_pandas(eval_df)
+            train_dataset = Dataset.from_pandas(train_df)
+            eval_dataset = Dataset.from_pandas(eval_df)
 
             # Calculate LoRA Hyperparameters
-            hyperparameters = self.calculate_lora_hyperparameters(len(df))
+            hyperparameters = self.calculate_lora_hyperparameters(len(processed_df))
 
             # Start training the model
             self.fine_tune(
                 user_id=user_id,
-                train_df=train_df,
-                eval_df=eval_df,
+                train_df=train_dataset,
+                eval_df=eval_dataset,
                 knowledge_id=knowledge_id,
                 r=hyperparameters['r'],
                 lora_alpha=hyperparameters['lora_alpha']
@@ -505,8 +565,6 @@ class ModelService:
 
         except ValueError as e:
             logger.error(f"Validation error while fine-tuning: {e}")
-
-            # Update the knowledge status
             file_data['status'] = 'Failed'
             _ = Knowledge_table.update_knowledge_data_by_id(
                 id=knowledge_id,
@@ -515,8 +573,6 @@ class ModelService:
 
         except Exception as e:
             logger.error(f"Fine-tuning error: {e}")
-
-            # Update the knowledge status
             file_data['status'] = 'Failed'
             _ = Knowledge_table.update_knowledge_data_by_id(
                 id=knowledge_id,
@@ -541,8 +597,11 @@ class ModelService:
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=[
-                'q_proj', 'k_proj', 'v_proj',
-                'o_proj', 'gate_proj', 'up_proj', 'down_proj'
+                'q_proj',
+                'k_proj',
+                'v_proj',
+                'o_proj',
+                'gate_proj'
             ]
         )
 
@@ -552,8 +611,8 @@ class ModelService:
     def fine_tune(
             self,
             user_id: str,
-            train_df: Any,
-            eval_df: Any,
+            train_df: Dataset,
+            eval_df: Dataset,
             r: int,
             lora_alpha: int,
             knowledge_id: str,
@@ -561,15 +620,15 @@ class ModelService:
             bf16: bool = False,
             num_epochs: int = 2,
             eval_steps: int = 100,
-            optim: str = "paged_adamw_32bit",
+            optim: str = "adamw_bnb_8bit",
             logging_steps: int = 10,
             warmup_steps: int = 50,
             max_seq_len: int = 512,
             group_by_length: bool = True,
             learning_rate: float = 2e-4,
-            per_device_train_batch_size=5,
-            per_device_eval_batch_size=5,
-            gradient_accumulation_steps=2,
+            per_device_train_batch_size: int = 5,
+            per_device_eval_batch_size: int = 5,
+            gradient_accumulation_steps: int = 2,
             report_to: str = 'none'
     ):
         """
@@ -577,8 +636,8 @@ class ModelService:
 
         Args:
             user_id (str): Unique ID of the user
-            train_df (Any): Training dataset
-            eval_df (Any): Evaluation dataset
+            train_df (Dataset): Training dataset
+            eval_df (Dataset): Evaluation dataset
             r (int): LoRA rank
             lora_alpha (int): LoRA scaling factor
             knowledge_id (str): Unique ID of the knowledge request
@@ -597,11 +656,15 @@ class ModelService:
             gradient_accumulation_steps (int): Gradient accumulation steps
             report_to (str): Report the training and evaluation results
 
-        Yields:
-            str: Progress updates during fine-tuning
+        Raises:
+            FineTuningDisabledError: If a fine-tuning task is already in progress
+            ValueError: If model or tokenizer is not initialized
         """
         if not self.inference_enabled:
             raise FineTuningDisabledError('A fine-tuning task is in progress!')
+
+        if self.model is None or self.tokenizer is None:
+            raise ValueError("Model or tokenizer is not initialized")
 
         # Disable inference during training
         self.inference_enabled = False
