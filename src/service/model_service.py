@@ -2,26 +2,30 @@ import gc
 import logging
 import os
 import re
-from threading import Thread
-from typing import Any
+from threading import Thread, Event
+from typing import Optional, Union
 
 import ftfy
+import numpy as np
 import pandas as pd
 import torch
+import wandb
 from datasets import Dataset
 from dotenv import load_dotenv
-from peft import (
-    PeftModel,
-    LoraConfig,
-    get_peft_model,
-)
+from peft.peft_model import PeftModel
+from peft.mixed_model import PeftMixedModel
+from peft.tuners.lora import LoraConfig
+from peft.mapping import get_peft_model
 from sklearn.model_selection import train_test_split
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer
 )
 from trl import SFTTrainer, SFTConfig
+from src.service.callback.cancel_callback import CancelCallback
 
 from src.exception.fine_tuning_disabled_error import FineTuningDisabledError
 from src.exception.inference_disabled_error import InferenceDisabledError
@@ -29,6 +33,9 @@ from src.service import prompt_service
 from src.service.database.knowledge import Knowledge_table
 from src.service.storage_manager import storage_manager
 from src.service.smart_adapt_streamer import SmartAdaptStreamer
+import zipfile
+import io
+
 
 load_dotenv()
 
@@ -37,7 +44,8 @@ logger = logging.getLogger(__name__)
 # Load the Sentence Transformer Model and the HF token
 MODEL_ID = str(os.getenv('MODEL_ID'))
 HF_TOKEN = str(os.getenv('HF_TOKEN'))
-
+wandb_api_key = str(os.getenv("WANDB_API_KEY"))
+wandb_project = str(os.getenv("WANDB_PROJECT", "smart-adapt"))
 
 class ModelService:
     """
@@ -45,35 +53,48 @@ class ModelService:
     """
 
     def __init__(self):
-        self.token = HF_TOKEN
-        self.data_model_name = 'adapters'
-        self.logs_dir = 'logs'
+        self.token: str = HF_TOKEN
+        self.data_model_name: str = 'adapters'
+        self.logs_dir: str = 'logs'
 
         # Define model and tokenizer for reasoning
-        self.tokenizer = None
-        self.model = None
+        self.tokenizer: Optional[PreTrainedTokenizer] = None
+        self.model: Optional[Union[PreTrainedModel, PeftModel, PeftMixedModel]] = None
 
         # Define the device
-        if torch.cuda.is_available():
-            current_device_index = torch.cuda.current_device()
-            self.device = torch.device(f"cuda:{current_device_index}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device(f"cuda" if torch.cuda.is_available() else "cpu") 
 
         # Define the current user
-        self.current_user = None
-        self.lora_loaded = False
-        self.inference_enabled = True
-        self.loaded_lora_ids = []
+        self.current_user: Optional[str] = None
+        self.lora_loaded: bool = False
+        self.inference_enabled: bool = True
+        self.loaded_lora_ids: list[str] = []
+
+        # Stores cancel events for ongoing fine-tune jobs keyed by user_id
+        self._cancel_events: dict[str, Event] = {}
 
         # Define repetition penalty for completions
-        self.repetition_penalty = 1.2
+        self.repetition_penalty: float = 1.2
+
+        # Define the training token limit
+        self.max_seq_len: int = 512
 
         # Load weights
         self._load_weights()
 
-    def flush(self):
-        # Disable inference temporarily
+    def flush(self, reset_inference_enabled: bool = True):
+        """
+        Flushes the currently loaded model from memory and reloads the base weights.
+
+        Args:
+            reset_inference_enabled (bool): Whether the ``inference_enabled`` flag
+                should be set back to ``True`` after the reload is complete. When
+                performing a long-running operation such as fine-tuning you may
+                want to keep inference disabled until the operation has
+                finished. Defaults to ``True`` so existing call-sites keep the
+                original behaviour.
+        """
+        # Disable inference temporarily while we unload the model
         self.inference_enabled = False
 
         # Unload the thinker and inference models along with the tokenizers
@@ -86,14 +107,15 @@ class ModelService:
 
         # Clear cache
         gc.collect()
-        if self.device == 'cuda':
+        if self.device.type == 'cuda':
             torch.cuda.empty_cache()
 
         # Load the model again
         self._load_weights()
 
-        # Reset the inference status
-        self.inference_enabled = True
+        # Reset the inference status only if requested
+        if reset_inference_enabled:
+            self.inference_enabled = True
         self.loaded_lora_ids = []
 
     @classmethod
@@ -111,8 +133,8 @@ class ModelService:
         - ValueError: If input parameters are invalid.
         """
         # Input validation
-        if not dataset_size:
-            raise ValueError("Model size and dataset size must be positive")
+        if dataset_size <= 0:
+            raise ValueError("Dataset size must be a positive integer")
 
         # Calculate r and alpha based on the dataset size
         r = 8 if dataset_size <= 1000 else 32 if dataset_size <= 100000 else 64
@@ -163,6 +185,9 @@ class ModelService:
         Returns:
             text-generation pipeline
         """
+        if self.model is None:
+            raise ValueError("Model is not initialized")
+
         # Check for the current user
         if knowledge_ids is None:
             knowledge_ids = []
@@ -206,7 +231,7 @@ class ModelService:
             self.loaded_lora_ids.append(knowledge_id)
 
         # Merge the adapter permanently
-        if self.lora_loaded and merge_and_unload:
+        if self.lora_loaded and merge_and_unload and isinstance(self.model, PeftModel):
             self.model = self.model.merge_and_unload()
 
         # Assign the current user
@@ -215,8 +240,12 @@ class ModelService:
     async def rewrite_query(
             self,
             current_query: str,
-            history: list
+            history: list,
+            max_seq_len: int = 512
     ):
+        if self.tokenizer is None or self.model is None:
+            raise ValueError("Model or tokenizer is not initialized")
+
         logger.info('Started extracting user messages from the history...')
 
         # Extract previous queries
@@ -261,9 +290,10 @@ class ModelService:
         # Define the generation kwargs
         thinker_kwargs = dict(
             input_ids=tokens.input_ids,
-            max_new_tokens=512,
+            max_new_tokens=max_seq_len,
             repetition_penalty=self.repetition_penalty,
-            streamer=streamer
+            streamer=streamer,
+            **self._generation_defaults()
         )
         logger.info('Started generating the updated query...')
 
@@ -298,6 +328,9 @@ class ModelService:
         if not self.inference_enabled:
             raise InferenceDisabledError("The model is being trained. Please try again later!")
 
+        if self.tokenizer is None or self.model is None:
+            raise ValueError("Model or tokenizer is not initialized")
+
         # Load user adapter
         self._load_adapters(user_id, knowledge_ids)
 
@@ -328,9 +361,9 @@ class ModelService:
             max_new_tokens=2048,
             repetition_penalty=self.repetition_penalty,
             streamer=streamer,
+            **self._generation_defaults(),
             **params
         )
-
         logger.info('Started the response generation')
 
         # Define the thread
@@ -371,17 +404,43 @@ class ModelService:
             token=self.token
         )
 
+        # Ensure we have pad and eos tokens; fall back to unk_token if absent
+        if self.tokenizer.pad_token is None:
+            # Prefer reusing EOS or UNK as pad token to avoid resizing
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
+
+        if self.tokenizer.eos_token is None:
+            # Use pad_token as EOS when missing
+            self.tokenizer.eos_token = self.tokenizer.pad_token
+
         # Load the model
         logger.info('Started loading the model')
         self.model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             token=self.token,
-            device_map=self.device,
+            device_map="auto",
             quantization_config=bnb_config
         )
 
         # Set padding token
         self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def _generation_defaults(self):
+        """Return safe generation kwargs, omitting pad/eos IDs if they are undefined."""
+        defaults = {
+            "do_sample": True,
+            "top_p": 0.9,
+            "temperature": 0.7,
+        }
+        if self.tokenizer is not None:
+            if self.tokenizer.pad_token_id is not None:
+                defaults["pad_token_id"] = self.tokenizer.pad_token_id
+            if self.tokenizer.eos_token_id is not None:
+                defaults["eos_token_id"] = self.tokenizer.eos_token_id
+        return defaults
 
     def fine_tuning_handler(
             self,
@@ -393,19 +452,29 @@ class ModelService:
             file_data: dict
     ):
         try:
+            if df is None or not isinstance(df, pd.DataFrame):
+                raise ValueError("Dataset must be a pandas DataFrame")
+            if self.model is None:
+                raise ValueError("Model is not loaded")
+            if self.tokenizer is None:
+                raise ValueError("Tokenizer is not loaded")
+
             # Pre-process the data
             documents = []
             for index, row in df.iterrows():
                 question = row[question_column_name]
                 answer = row[answer_column_name]
 
-                # Skip any empty rows
-                if not question or not answer or isinstance(question, float) or isinstance(answer, float):
+                # Basic validation / cleaning
+                if pd.isna(question) or pd.isna(answer):
                     continue
 
-                # Fix any inconsistencies
-                question = ftfy.fix_text(question)
-                answer = ftfy.fix_text(answer)
+                question = ftfy.fix_text(str(question))
+                answer = ftfy.fix_text(str(answer))
+
+                # Skip if either side is empty after stripping
+                if not question.strip() or not answer.strip():
+                    continue
 
                 # Formulate the history
                 history = [
@@ -427,14 +496,33 @@ class ModelService:
                     formatted_history,
                     padding="max_length",
                     truncation=True,
-                    max_length=512
+                    max_length=self.max_seq_len
                 )
 
-                # Create labels (shifted input IDs for causal language modeling)
-                tokenized_data["labels"] = tokenized_data["input_ids"].copy()
+                # Convert input_ids to list for manipulation
+                input_ids = tokenized_data["input_ids"].tolist() if isinstance(tokenized_data["input_ids"], torch.Tensor) else tokenized_data["input_ids"]
 
-                # Ignore padding tokens for loss calculation
-                tokenized_data["labels"][tokenized_data["labels"] == self.tokenizer.pad_token_id] = -100
+                # Build a label mask initialised to -100 (ignored by the loss)
+                labels = [-100] * len(input_ids)
+
+                # Token-ids of the assistant answer
+                answer_token_ids = self.tokenizer(
+                    answer,
+                    add_special_tokens=False
+                )["input_ids"]
+
+                # Starting from the end, copy answer tokens onto the label mask
+                idx_input = len(input_ids) - 1
+                idx_answer = len(answer_token_ids) - 1
+                pad_id = self.tokenizer.pad_token_id
+
+                while idx_input >= 0 and idx_answer >= 0:
+                    if input_ids[idx_input] != pad_id:
+                        labels[idx_input] = answer_token_ids[idx_answer]
+                        idx_answer -= 1
+                    idx_input -= 1
+
+                tokenized_data["labels"] = labels
                 documents.append(tokenized_data)
 
             # Remove the previous dataframe
@@ -443,33 +531,35 @@ class ModelService:
 
             # Check for documents are present
             if not documents:
-                raise ValueError("No documents")
+                raise ValueError("No valid documents found in the dataset")
 
             # Convert to DataFrame
-            df = pd.DataFrame(documents)
+            processed_df = pd.DataFrame(documents)
 
             # Split for train, eval
-            train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
+            train_df, eval_df = train_test_split(processed_df, test_size=0.2, random_state=42)
 
             # Convert to dataset supportable format
-            train_df = Dataset.from_pandas(train_df)
-            eval_df = Dataset.from_pandas(eval_df)
+            train_dataset = Dataset.from_pandas(train_df)
+            eval_dataset = Dataset.from_pandas(eval_df)
 
             # Calculate LoRA Hyperparameters
-            hyperparameters = self.calculate_lora_hyperparameters(len(df))
+            hyperparameters = self.calculate_lora_hyperparameters(len(processed_df))
 
             # Start training the model
             self.fine_tune(
                 user_id=user_id,
-                train_df=train_df,
-                eval_df=eval_df,
+                train_df=train_dataset,
+                eval_df=eval_dataset,
+                file_data=file_data,
                 knowledge_id=knowledge_id,
                 r=hyperparameters['r'],
                 lora_alpha=hyperparameters['lora_alpha']
             )
 
-            # Update the knowledge status
-            file_data['status'] = 'Completed'
+        except ValueError as e:
+            logger.error(f"Validation error while fine-tuning: {e}")
+            file_data['status'] = 'Failed'
             _ = Knowledge_table.update_knowledge_data_by_id(
                 id=knowledge_id,
                 data=file_data
@@ -477,8 +567,6 @@ class ModelService:
 
         except Exception as e:
             logger.error(f"Fine-tuning error: {e}")
-
-            # Update the knowledge status
             file_data['status'] = 'Failed'
             _ = Knowledge_table.update_knowledge_data_by_id(
                 id=knowledge_id,
@@ -503,8 +591,11 @@ class ModelService:
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=[
-                'q_proj', 'k_proj', 'v_proj',
-                'o_proj', 'gate_proj', 'up_proj', 'down_proj'
+                'q_proj',
+                'k_proj',
+                'v_proj',
+                'o_proj',
+                'gate_proj'
             ]
         )
 
@@ -514,8 +605,9 @@ class ModelService:
     def fine_tune(
             self,
             user_id: str,
-            train_df: Any,
-            eval_df: Any,
+            train_df: Dataset,
+            eval_df: Dataset,
+            file_data: dict,
             r: int,
             lora_alpha: int,
             knowledge_id: str,
@@ -523,15 +615,15 @@ class ModelService:
             bf16: bool = False,
             num_epochs: int = 2,
             eval_steps: int = 100,
-            optim: str = "paged_adamw_32bit",
+            optim: str = "adamw_bnb_8bit",
             logging_steps: int = 10,
             warmup_steps: int = 50,
             max_seq_len: int = 512,
             group_by_length: bool = True,
             learning_rate: float = 2e-4,
-            per_device_train_batch_size=5,
-            per_device_eval_batch_size=5,
-            gradient_accumulation_steps=2,
+            per_device_train_batch_size: int = 5,
+            per_device_eval_batch_size: int = 5,
+            gradient_accumulation_steps: int = 2,
             report_to: str = 'none'
     ):
         """
@@ -539,8 +631,8 @@ class ModelService:
 
         Args:
             user_id (str): Unique ID of the user
-            train_df (Any): Training dataset
-            eval_df (Any): Evaluation dataset
+            train_df (Dataset): Training dataset
+            eval_df (Dataset): Evaluation dataset
             r (int): LoRA rank
             lora_alpha (int): LoRA scaling factor
             knowledge_id (str): Unique ID of the knowledge request
@@ -559,77 +651,195 @@ class ModelService:
             gradient_accumulation_steps (int): Gradient accumulation steps
             report_to (str): Report the training and evaluation results
 
-        Yields:
-            str: Progress updates during fine-tuning
+        Raises:
+            FineTuningDisabledError: If a fine-tuning task is already in progress
+            ValueError: If model or tokenizer is not initialized
         """
         if not self.inference_enabled:
             raise FineTuningDisabledError('A fine-tuning task is in progress!')
 
+        if self.model is None or self.tokenizer is None:
+            raise ValueError("Model or tokenizer is not initialized")
+
         # Disable inference during training
         self.inference_enabled = False
 
-        # Unload and reset weights
-        self.flush()
+        try:
+            # Unload and reset weights while keeping inference disabled
+            self.flush(reset_inference_enabled=False)
 
-        # Prepare the data storage
-        data_path = storage_manager.get_user_dir(user_id)
+            # Prepare the data storage
+            data_path = storage_manager.get_user_dir(user_id)
 
-        # Define the adapter and logs path
-        adapter_path = self.get_lora_path(
-            data_path=data_path,
+            # Define the adapter and logs path
+            adapter_path = self.get_lora_path(
+                data_path=data_path,
+                knowledge_id=knowledge_id
+            )
+            logs_dir_path = self.get_logs_path(
+                data_path=data_path,
+                knowledge_id=knowledge_id
+            )
+
+            # Prepare model and tokenizer
+            self.prepare_model(
+                r=r,
+                lora_alpha=lora_alpha
+            )
+
+            # Initialise Weights & Biases (W&B) tracking if an API key is available
+            use_wandb = bool(wandb_api_key)
+
+            report_to = "none"
+            if use_wandb:
+                # Log in to W&B using the API key from the environment (.env)
+                wandb.login(key=wandb_api_key)
+
+                # Use a descriptive run name containing the user_id and knowledge_id for easy lookup
+                run_name = f"{user_id}_{knowledge_id}"
+
+                # Start the run and attach useful metadata
+                wandb.init(
+                    project=wandb_project,
+                    name=run_name,
+                    tags=[knowledge_id, user_id],
+                    config={
+                        "lora_r": r,
+                        "lora_alpha": lora_alpha,
+                        "epochs": num_epochs,
+                        "learning_rate": learning_rate,
+                        "batch_size": per_device_train_batch_size,
+                    },
+                )
+
+                # Ensure the trainer logs to W&B
+                report_to = "wandb"
+
+            # Training arguments
+            training_arguments = SFTConfig(
+                output_dir=logs_dir_path,
+                per_device_train_batch_size=per_device_train_batch_size,
+                per_device_eval_batch_size=per_device_eval_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                optim=optim,
+                num_train_epochs=num_epochs,
+                eval_strategy="steps",
+                eval_steps=eval_steps,
+                logging_steps=logging_steps,
+                warmup_steps=warmup_steps,
+                logging_strategy="steps",
+                learning_rate=learning_rate,
+                fp16=fp16,
+                bf16=bf16,
+                group_by_length=group_by_length,
+                max_seq_length=max_seq_len,
+                report_to=report_to,
+                save_strategy="steps",
+                save_steps=eval_steps,
+                save_total_limit=1,
+                load_best_model_at_end=False,
+                metric_for_best_model=None,
+                greater_is_better=None
+            )
+
+            # Create/record a cancellation event for this user
+            cancel_event = Event()
+            self._cancel_events[user_id] = cancel_event
+
+            # Define cancellation callback
+            cancel_callback = CancelCallback(cancel_event)
+
+            # Initialize trainer with cancellation callback
+            trainer = SFTTrainer(
+                model=self.model,
+                train_dataset=train_df,
+                eval_dataset=eval_df,
+                peft_config=None,  # Already applied
+                processing_class=self.tokenizer,
+                args=training_arguments,
+                callbacks=[cancel_callback]
+            )
+
+            # Perform training
+            trainer.train()
+
+            # Check if training was cancelled
+            if cancel_event.is_set():
+                file_data['status'] = 'Stopped'
+
+            else:
+                # Update the knowledge status only if not cancelled
+                file_data['status'] = 'Completed'
+
+                # Save model only if training wasn't cancelled
+                os.makedirs(adapter_path, exist_ok=True)
+                trainer.model.save_pretrained(adapter_path)
+
+            # Update the knowledge status
+            _ = Knowledge_table.update_knowledge_data_by_id(
+                id=knowledge_id,
+                data=file_data
+            )
+
+        finally:
+            # Remove cancel event reference
+            self._cancel_events.pop(user_id, None)
+
+            # Reset the memory and weights
+            self.flush()
+
+            # Finish the W&B run if one was started
+            if use_wandb:
+                try:
+                    wandb.finish()
+                except Exception:  # noqa: BLE001
+                    pass  # Ignore any wandb specific errors during shutdown
+
+    def stop_fine_tuning(self, user_id: str):
+        """Request cancellation of an ongoing fine-tune job for the given user.
+
+        Args:
+            user_id (str): The ID of the user whose training should be stopped
+            knowledge_id (str): The ID of the knowledge being trained
+            knowledge (dict): The knowledge data
+
+        Raises:
+            ValueError: If no active fine-tuning task exists for the user
+        """
+        try:
+            cancel_event = self._cancel_events.get(user_id)
+            if cancel_event is None:
+                raise ValueError(f"No active fine-tuning task found for user {user_id}")
+
+            # Signal the training loop to stop
+            cancel_event.set()
+            logger.info(f"Cancellation requested for user {user_id}'s fine-tune job.")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to stop training process: {e}")
+            raise ValueError("Failed to stop training process") from e
+
+    def get_lora_zip_stream(self, user_id: str, knowledge_id: str) -> io.BytesIO:
+        """
+        Zips the LoRA adapter directory for the given user_id and knowledge_id and returns a BytesIO stream.
+        Raises FileNotFoundError if the directory does not exist or is empty.
+        """
+        userdata_dir = storage_manager.get_user_dir(user_id)
+        lora_path = self.get_lora_path(
+            data_path=userdata_dir,
             knowledge_id=knowledge_id
         )
-        logs_dir_path = self.get_logs_path(
-            data_path=data_path,
-            knowledge_id=knowledge_id
-        )
-
-        # Prepare model and tokenizer
-        self.prepare_model(
-            r=r,
-            lora_alpha=lora_alpha
-        )
-
-        # Training arguments
-        training_arguments = SFTConfig(
-            output_dir=logs_dir_path,
-            per_device_train_batch_size=per_device_train_batch_size,
-            per_device_eval_batch_size=per_device_eval_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            optim=optim,
-            num_train_epochs=num_epochs,
-            eval_strategy="steps",
-            eval_steps=eval_steps,
-            logging_steps=logging_steps,
-            warmup_steps=warmup_steps,
-            logging_strategy="steps",
-            learning_rate=learning_rate,
-            fp16=fp16,
-            bf16=bf16,
-            group_by_length=group_by_length,
-            max_seq_length=max_seq_len,
-            report_to=report_to
-        )
-
-        # Initialize trainer
-        trainer = SFTTrainer(
-            model=self.model,
-            train_dataset=train_df,
-            eval_dataset=eval_df,
-            peft_config=None,  # Already applied
-            tokenizer=self.tokenizer,
-            args=training_arguments,
-        )
-
-        # Perform training
-        trainer.train()
-
-        # Save model
-        os.makedirs(adapter_path, exist_ok=True)
-        trainer.model.save_pretrained(adapter_path)
-
-        # Reset the memory and weights
-        self.flush()
-
+        if not os.path.exists(lora_path) or not os.listdir(lora_path):
+            raise FileNotFoundError("LoRA adapter directory not found or is empty.")
+        zip_stream = io.BytesIO()
+        with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(lora_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, lora_path)
+                    zipf.write(file_path, arcname)
+        zip_stream.seek(0)
+        return zip_stream
 
 model_service = ModelService()

@@ -3,9 +3,11 @@ import logging
 import os
 import shutil
 import uuid
+import zipfile
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse
 
 from src.exception.fine_tuning_disabled_error import FineTuningDisabledError
 from src.model.user_knowledge_model import UserKnowledgeModel
@@ -150,6 +152,58 @@ async def delete_lora_adapter(user_id: str, knowledge_id: str):
 
     except Exception as e:
         log.error(f"LoRA adapter removal error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.post("/fine-tune/stop", status_code=status.HTTP_200_OK)
+async def stop_fine_tune(user_id: str = Form(...), knowledge_id: str = Form(...)):
+    """Endpoint to request cancellation of an ongoing fine-tuning job.
+    The request is identified solely by the `user_id` who started it.
+    """
+    try:
+        # Get the corresponding knowledge
+        knowledge = Knowledge_table.get_knowledge_by_id(knowledge_id)
+        if knowledge is None:
+            raise ValueError("Knowledge does not exist!")
+        
+        model_service.stop_fine_tuning(user_id)
+        return {"status": "successful"}
+
+    except ValueError as e:
+        log.error(f"Stop fine-tune error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        log.error(f"Stop fine-tune error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@router.get("/adapter/download", status_code=status.HTTP_200_OK)
+async def download_lora_adapter(user_id: str, knowledge_id: str):
+    """
+    Endpoint to download the LoRA adapter directory as a zip file for a given user_id and knowledge_id.
+    """
+    try:
+        zip_stream = model_service.get_lora_zip_stream(user_id, knowledge_id)
+        filename = f"lora_adapter_{user_id}_{knowledge_id}.zip"
+        return StreamingResponse(zip_stream, media_type="application/x-zip-compressed", headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        })
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="LoRA adapter directory not found or is empty."
+        )
+    except Exception as e:
+        log.error(f"LoRA adapter download error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
