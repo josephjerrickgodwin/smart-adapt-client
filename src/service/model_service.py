@@ -551,16 +551,10 @@ class ModelService:
                 user_id=user_id,
                 train_df=train_dataset,
                 eval_df=eval_dataset,
+                file_data=file_data,
                 knowledge_id=knowledge_id,
                 r=hyperparameters['r'],
                 lora_alpha=hyperparameters['lora_alpha']
-            )
-
-            # Update the knowledge status
-            file_data['status'] = 'Completed'
-            _ = Knowledge_table.update_knowledge_data_by_id(
-                id=knowledge_id,
-                data=file_data
             )
 
         except ValueError as e:
@@ -613,6 +607,7 @@ class ModelService:
             user_id: str,
             train_df: Dataset,
             eval_df: Dataset,
+            file_data: dict,
             r: int,
             lora_alpha: int,
             knowledge_id: str,
@@ -669,129 +664,161 @@ class ModelService:
         # Disable inference during training
         self.inference_enabled = False
 
-        # Unload and reset weights while keeping inference disabled
-        self.flush(reset_inference_enabled=False)
+        try:
+            # Unload and reset weights while keeping inference disabled
+            self.flush(reset_inference_enabled=False)
 
-        # Prepare the data storage
-        data_path = storage_manager.get_user_dir(user_id)
+            # Prepare the data storage
+            data_path = storage_manager.get_user_dir(user_id)
 
-        # Define the adapter and logs path
-        adapter_path = self.get_lora_path(
-            data_path=data_path,
-            knowledge_id=knowledge_id
-        )
-        logs_dir_path = self.get_logs_path(
-            data_path=data_path,
-            knowledge_id=knowledge_id
-        )
-
-        # Prepare model and tokenizer
-        self.prepare_model(
-            r=r,
-            lora_alpha=lora_alpha
-        )
-
-        # Initialise Weights & Biases (W&B) tracking if an API key is available
-        use_wandb = bool(wandb_api_key)
-
-        report_to = "none"
-        if use_wandb:
-            # Log in to W&B using the API key from the environment (.env)
-            wandb.login(key=wandb_api_key)
-
-            # Use a descriptive run name containing the user_id and knowledge_id for easy lookup
-            run_name = f"{user_id}_{knowledge_id}"
-
-            # Start the run and attach useful metadata
-            wandb.init(
-                project=wandb_project,
-                name=run_name,
-                tags=[knowledge_id, user_id],
-                config={
-                    "lora_r": r,
-                    "lora_alpha": lora_alpha,
-                    "epochs": num_epochs,
-                    "learning_rate": learning_rate,
-                    "batch_size": per_device_train_batch_size,
-                },
+            # Define the adapter and logs path
+            adapter_path = self.get_lora_path(
+                data_path=data_path,
+                knowledge_id=knowledge_id
+            )
+            logs_dir_path = self.get_logs_path(
+                data_path=data_path,
+                knowledge_id=knowledge_id
             )
 
-            # Ensure the trainer logs to W&B
-            report_to = "wandb"
+            # Prepare model and tokenizer
+            self.prepare_model(
+                r=r,
+                lora_alpha=lora_alpha
+            )
 
-        # Training arguments
-        training_arguments = SFTConfig(
-            output_dir=logs_dir_path,
-            per_device_train_batch_size=per_device_train_batch_size,
-            per_device_eval_batch_size=per_device_eval_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            optim=optim,
-            num_train_epochs=num_epochs,
-            eval_strategy="steps",
-            eval_steps=eval_steps,
-            logging_steps=logging_steps,
-            warmup_steps=warmup_steps,
-            logging_strategy="steps",
-            learning_rate=learning_rate,
-            fp16=fp16,
-            bf16=bf16,
-            group_by_length=group_by_length,
-            max_seq_length=max_seq_len,
-            report_to=report_to
-        )
+            # Initialise Weights & Biases (W&B) tracking if an API key is available
+            use_wandb = bool(wandb_api_key)
 
-        # Create/record a cancellation event for this user
-        cancel_event = Event()
-        self._cancel_events[user_id] = cancel_event
+            report_to = "none"
+            if use_wandb:
+                # Log in to W&B using the API key from the environment (.env)
+                wandb.login(key=wandb_api_key)
 
-        # Define cancellation callback
-        cancel_callback = CancelCallback(cancel_event)
+                # Use a descriptive run name containing the user_id and knowledge_id for easy lookup
+                run_name = f"{user_id}_{knowledge_id}"
 
-        # Initialize trainer with cancellation callback
-        trainer = SFTTrainer(
-            model=self.model,
-            train_dataset=train_df,
-            eval_dataset=eval_df,
-            peft_config=None,  # Already applied
-            processing_class=self.tokenizer,
-            args=training_arguments,
-            callbacks=[cancel_callback]
-        )
+                # Start the run and attach useful metadata
+                wandb.init(
+                    project=wandb_project,
+                    name=run_name,
+                    tags=[knowledge_id, user_id],
+                    config={
+                        "lora_r": r,
+                        "lora_alpha": lora_alpha,
+                        "epochs": num_epochs,
+                        "learning_rate": learning_rate,
+                        "batch_size": per_device_train_batch_size,
+                    },
+                )
 
-        # Perform training
-        trainer.train()
+                # Ensure the trainer logs to W&B
+                report_to = "wandb"
 
-        # Save model
-        os.makedirs(adapter_path, exist_ok=True)
-        trainer.model.save_pretrained(adapter_path)
+            # Training arguments
+            training_arguments = SFTConfig(
+                output_dir=logs_dir_path,
+                per_device_train_batch_size=per_device_train_batch_size,
+                per_device_eval_batch_size=per_device_eval_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                optim=optim,
+                num_train_epochs=num_epochs,
+                eval_strategy="steps",
+                eval_steps=eval_steps,
+                logging_steps=logging_steps,
+                warmup_steps=warmup_steps,
+                logging_strategy="steps",
+                learning_rate=learning_rate,
+                fp16=fp16,
+                bf16=bf16,
+                group_by_length=group_by_length,
+                max_seq_length=max_seq_len,
+                report_to=report_to,
+                save_strategy="steps",
+                save_steps=eval_steps,
+                save_total_limit=1,
+                load_best_model_at_end=False,
+                metric_for_best_model=None,
+                greater_is_better=None
+            )
 
-        # Remove cancel event reference
-        self._cancel_events.pop(user_id, None)
+            # Create/record a cancellation event for this user
+            cancel_event = Event()
+            self._cancel_events[user_id] = cancel_event
 
-        # Reset the memory and weights
-        self.flush()
+            # Define cancellation callback
+            cancel_callback = CancelCallback(cancel_event)
 
-        # Finish the W&B run if one was started
-        if use_wandb:
-            try:
-                wandb.finish()
-            except Exception:  # noqa: BLE001
-                pass  # Ignore any wandb specific errors during shutdown
+            # Initialize trainer with cancellation callback
+            trainer = SFTTrainer(
+                model=self.model,
+                train_dataset=train_df,
+                eval_dataset=eval_df,
+                peft_config=None,  # Already applied
+                processing_class=self.tokenizer,
+                args=training_arguments,
+                callbacks=[cancel_callback]
+            )
+
+            # Perform training
+            trainer.train()
+
+            # Check if training was cancelled
+            if cancel_event.is_set():
+                file_data['status'] = 'Stopped'
+
+            else:
+                # Update the knowledge status only if not cancelled
+                file_data['status'] = 'Completed'
+
+                # Save model only if training wasn't cancelled
+                os.makedirs(adapter_path, exist_ok=True)
+                trainer.model.save_pretrained(adapter_path)
+
+            # Update the knowledge status
+            _ = Knowledge_table.update_knowledge_data_by_id(
+                id=knowledge_id,
+                data=file_data
+            )
+
+        finally:
+            # Remove cancel event reference
+            self._cancel_events.pop(user_id, None)
+
+            # Reset the memory and weights
+            self.flush()
+
+            # Finish the W&B run if one was started
+            if use_wandb:
+                try:
+                    wandb.finish()
+                except Exception:  # noqa: BLE001
+                    pass  # Ignore any wandb specific errors during shutdown
 
     def stop_fine_tuning(self, user_id: str):
         """Request cancellation of an ongoing fine-tune job for the given user.
 
-        This works cooperatively: the training loop will stop at the end of the
-        current step. If no job is found for the user an error is raised.
+        Args:
+            user_id (str): The ID of the user whose training should be stopped
+            knowledge_id (str): The ID of the knowledge being trained
+            knowledge (dict): The knowledge data
+
+        Raises:
+            ValueError: If no active fine-tuning task exists for the user
         """
-        cancel_event = self._cancel_events.get(user_id)
-        if cancel_event is None:
-            raise ValueError("No active fine-tuning task for the specified user.")
+        try:
+            cancel_event = self._cancel_events.get(user_id)
+            if cancel_event is None:
+                raise ValueError(f"No active fine-tuning task found for user {user_id}")
 
-        # Signal the training loop to stop
-        cancel_event.set()
+            # Signal the training loop to stop
+            cancel_event.set()
+            logger.info(f"Cancellation requested for user {user_id}'s fine-tune job.")
+            return True
 
-        logger.info(f"Cancellation requested for user {user_id}'s fine-tune job.")
+        except Exception as e:
+            logger.error(f"Failed to stop training process: {e}")
+            raise ValueError("Failed to stop training process") from e
 
     def get_lora_zip_stream(self, user_id: str, knowledge_id: str) -> io.BytesIO:
         """

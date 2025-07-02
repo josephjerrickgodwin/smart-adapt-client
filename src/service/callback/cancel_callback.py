@@ -8,7 +8,59 @@ class CancelCallback(TrainerCallback):
     def __init__(self, _event: Event):
         self._event = _event
 
+    def on_step_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> TrainerControl:
+        if self._event.is_set():
+            control.should_training_stop = True
+            control.should_epoch_stop = True
+            control.should_save = True
+        return control
+
     def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> TrainerControl:
+        if self._event.is_set():
+            control.should_training_stop = True
+            control.should_epoch_stop = True
+            control.should_save = True
+        return control
+
+    def on_evaluate(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> TrainerControl:
+        if self._event.is_set():
+            control.should_training_stop = True
+            control.should_epoch_stop = True
+            control.should_save = True
+        return control
+
+    def on_epoch_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> TrainerControl:
+        if self._event.is_set():
+            control.should_training_stop = True
+            control.should_epoch_stop = True
+            control.should_save = True
+        return control
+
+    def on_epoch_end(
         self,
         args: TrainingArguments,
         state: TrainerState,

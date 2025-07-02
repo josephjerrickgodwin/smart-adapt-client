@@ -159,11 +159,16 @@ async def delete_lora_adapter(user_id: str, knowledge_id: str):
 
 
 @router.post("/fine-tune/stop", status_code=status.HTTP_200_OK)
-async def stop_fine_tune(user_id: str = Form(...)):
+async def stop_fine_tune(user_id: str = Form(...), knowledge_id: str = Form(...)):
     """Endpoint to request cancellation of an ongoing fine-tuning job.
     The request is identified solely by the `user_id` who started it.
     """
     try:
+        # Get the corresponding knowledge
+        knowledge = Knowledge_table.get_knowledge_by_id(knowledge_id)
+        if knowledge is None:
+            raise ValueError("Knowledge does not exist!")
+        
         model_service.stop_fine_tuning(user_id)
         return {"status": "successful"}
 
